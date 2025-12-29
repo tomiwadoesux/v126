@@ -1,0 +1,6 @@
+{
+  "style": "default",
+  "paths": {
+    "components": "@/components/ui"
+  }
+}
