@@ -125,11 +125,15 @@ export default function Home() {
   const [noLyrics, setNoLyrics] = useState(false);
   const [currentLineIndex, setCurrentLineIndex] = useState(0);
 
+  const [errorMessage, setErrorMessage] = useState("");
+  const [audioLevel, setAudioLevel] = useState(0);
+
   const songStartTimeRef = useRef(0);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const [recordingStream, setRecordingStream] = useState(null);
   const mimeTypeRef = useRef("audio/webm");
+  const audioLevelCheckRef = useRef(null);
 
   // REFS FOR KINETIC ANIMATION
   const tapeRef = useRef(null);
@@ -184,6 +188,9 @@ export default function Home() {
   const startRecording = async () => {
     try {
       setNoLyrics(false);
+      setErrorMessage("");
+      setAudioLevel(0);
+
       // High quality recording for music
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -194,6 +201,35 @@ export default function Home() {
       });
 
       setRecordingStream(stream);
+
+      // Setup audio level monitoring
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      let maxLevel = 0;
+      let lowLevelCount = 0;
+      const checkInterval = 200; // Check every 200ms
+
+      audioLevelCheckRef.current = setInterval(() => {
+        analyser.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((a, b) => a + b) / bufferLength;
+        const normalizedLevel = (average / 255) * 100;
+
+        setAudioLevel(normalizedLevel);
+        maxLevel = Math.max(maxLevel, normalizedLevel);
+
+        // Count how many times the level is too low
+        if (normalizedLevel < 10) {
+          lowLevelCount++;
+        }
+      }, checkInterval);
 
       let options = { audioBitsPerSecond: 128000 };
       if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
@@ -212,7 +248,28 @@ export default function Home() {
         if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
 
-      mediaRecorderRef.current.onstop = handleAudioStop;
+      mediaRecorderRef.current.onstop = () => {
+        // Clear audio level monitoring
+        if (audioLevelCheckRef.current) {
+          clearInterval(audioLevelCheckRef.current);
+        }
+
+        // Check if audio was too quiet overall
+        if (maxLevel < 15) {
+          setStatus("idle");
+          setErrorMessage(
+            "⚠️ Audio signal too weak. Please bring the speaker much closer to your microphone and try again."
+          );
+          if (recordingStream) {
+            recordingStream.getTracks().forEach((track) => track.stop());
+            setRecordingStream(null);
+          }
+          return;
+        }
+
+        handleAudioStop();
+      };
+
       mediaRecorderRef.current.start();
       setStatus("recording");
 
@@ -223,7 +280,20 @@ export default function Home() {
       }, 6000);
     } catch (err) {
       console.error("Mic access denied", err);
-      alert("Please allow microphone access");
+      if (err.name === "NotAllowedError") {
+        setErrorMessage(
+          "🎤 Microphone access denied. Please allow microphone permissions in your browser settings."
+        );
+      } else if (err.name === "NotFoundError") {
+        setErrorMessage(
+          "🎤 No microphone found. Please connect a microphone and try again."
+        );
+      } else {
+        setErrorMessage(
+          "❌ Could not access microphone. Please check your device settings."
+        );
+      }
+      setStatus("idle");
     }
   };
 
@@ -281,12 +351,51 @@ export default function Home() {
           fetchGeniusData(music.title, music.artists[0].name),
         ]);
       } else {
+        // Handle different error codes from ACRCloud
+        let errorMsg = "";
+
+        if (data.status.code === 1001) {
+          errorMsg =
+            "🔇 No music detected. Please bring the speaker closer to your microphone and ensure the music is playing clearly.";
+        } else if (data.status.code === 2004) {
+          errorMsg =
+            "📡 Can't reach music database. Please check your internet connection and try again.";
+        } else if (data.status.code === 3001) {
+          errorMsg =
+            "⏱️ Request timeout. The music sample may be too short or unclear. Please try again.";
+        } else if (data.status.code === 3000) {
+          errorMsg = "❌ Invalid audio format. Please try recording again.";
+        } else {
+          errorMsg =
+            "🎵 Could not identify this song. Try:\n• Bringing the speaker closer to your mic\n• Reducing background noise\n• Playing a different part of the song";
+        }
+
         console.warn("Match Failed", data);
-        alert("Could not identify song. Is it loud enough?");
+        setErrorMessage(errorMsg);
         setStatus("idle");
       }
     } catch (err) {
-      console.error(err);
+      console.error("Identification error:", err);
+
+      // Network error handling
+      if (err.code === "ERR_NETWORK" || err.message.includes("Network")) {
+        setErrorMessage(
+          "📡 Network error. Please check your internet connection and try again."
+        );
+      } else if (err.response?.status === 413) {
+        setErrorMessage(
+          "📦 Audio file too large. This shouldn't happen - please refresh and try again."
+        );
+      } else if (err.response?.status >= 500) {
+        setErrorMessage(
+          "🔧 Server error. The music recognition service may be temporarily down. Please try again in a moment."
+        );
+      } else {
+        setErrorMessage(
+          "❌ Something went wrong during identification. Please try again."
+        );
+      }
+
       setStatus("idle");
     }
   };
@@ -294,12 +403,17 @@ export default function Home() {
   // 2b. Fetch Genius Data
   const fetchGeniusData = async (track, artist) => {
     try {
+      console.log("Fetching Genius data for:", track, artist);
       const res = await axios.get("/api/genius", {
         params: { query: `${track} ${artist}` },
       });
-      if (res.data) setGeniusData(res.data);
+      console.log("Genius data received:", res.data);
+      if (res.data) {
+        console.log("Artwork URL:", res.data.artworkUrl);
+        setGeniusData(res.data);
+      }
     } catch (err) {
-      console.warn("Could not fetch Genius data", err);
+      console.warn("Could not fetch Genius data:", err.message);
     }
   };
 
@@ -413,15 +527,15 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Right: Controls */}
-          {status !== "idle" && (
-            <div className="flex gap-2 shrink-0">
+          {/* Right: Controls - Show X button when active OR when error shown */}
+          {(status !== "idle" || errorMessage) && (
+            <div className="flex items-center gap-2 shrink-0">
               {geniusData?.url && (
                 <a
                   href={geniusData.url}
                   target="_blank"
                   rel="noreferrer"
-                  className="p-2 text-white/40 hover:text-yellow-400 transition-colors"
+                  className="p-2 bg-white/10 hover:bg-yellow-400/20 text-white/60 hover:text-yellow-400 transition-all rounded-sm"
                 >
                   <ExternalLink className="w-5 h-5" />
                 </a>
@@ -434,6 +548,12 @@ export default function Home() {
                   setSongData(null);
                   setNoLyrics(false);
                   setMood("default");
+                  setErrorMessage("");
+
+                  // Clear audio level monitoring
+                  if (audioLevelCheckRef.current) {
+                    clearInterval(audioLevelCheckRef.current);
+                  }
 
                   if (mediaRecorderRef.current?.state === "recording")
                     mediaRecorderRef.current.stop();
@@ -444,7 +564,8 @@ export default function Home() {
                     setRecordingStream(null);
                   }
                 }}
-                className="p-2 text-white/40 hover:text-white transition-colors"
+                className="p-2 bg-white/10 hover:bg-red-500/20 text-white/60 hover:text-white transition-all rounded-sm font-bold"
+                title="Stop and return home"
               >
                 ✕
               </button>
@@ -476,6 +597,15 @@ export default function Home() {
             <h6 className="text-white font-medium tracking-wide">
               Tap to Identify
             </h6>
+
+            {/* Error Message Display */}
+            {errorMessage && (
+              <div className="mt-4 p-4 bg-red-500/10 border border-red-500/20 rounded-sm max-w-[380px] animate-in slide-in-from-bottom-4 duration-500">
+                <p className="text-sm text-red-200 leading-relaxed whitespace-pre-line text-center">
+                  {errorMessage}
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -486,6 +616,15 @@ export default function Home() {
             <p className="text-zinc-400 text-sm font-medium animate-pulse">
               Listening to environment...
             </p>
+
+            {/* Audio Level Warning */}
+            {audioLevel < 15 && (
+              <div className="mt-2 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-sm max-w-[350px] animate-pulse">
+                <p className="text-xs text-yellow-200 text-center">
+                  ⚠️ Audio signal weak - bring speaker closer
+                </p>
+              </div>
+            )}
           </div>
         )}
 
